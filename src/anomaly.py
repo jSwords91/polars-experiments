@@ -12,7 +12,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 
-
 @dataclass
 class AnomalyDetectorConfig:
     """Configuration for the AnomalyDetector."""
@@ -26,19 +25,6 @@ class PolarsAnomalyDetector:
         """Initialize with a configuration."""
         self.lag = config.lag
         self.threshold = config.threshold
-        
-    def ensure_lazy_df(self, df: Union[pl.DataFrame, pl.LazyFrame]) -> pl.LazyFrame:
-        """Ensure the input is either a DataFrame or LazyFrame and convert it to LazyFrame."""
-        if not isinstance(df, (pl.DataFrame, pl.LazyFrame)):
-            raise ValueError("Input must be a Polars DataFrame or LazyFrame.")
-        return df if isinstance(df, pl.LazyFrame) else df.lazy()
-
-    
-    def collect_lazy_df(self, df: pl.LazyFrame) -> pl.DataFrame:
-        """Convert LazyFrame back to DataFrame."""
-        if not isinstance(df, pl.LazyFrame):
-            raise ValueError("Input must be a Polars LazyFrame.")
-        return df.collect()
     
     def calculate_rolling_mean(self, column: str) -> pl.Series:
         """Calculate rolling mean of a given column."""
@@ -48,50 +34,35 @@ class PolarsAnomalyDetector:
         """Calculate rolling standard deviation of a given column."""
         return pl.col(column).rolling_std(self.lag, min_periods=2, center=False).alias(f"rolling_std_n{self.lag}")
 
-    def calculate_y_subtract_rolling_mean(self, column: str) -> pl.Series:
+    def calculate_y_subtract_rolling_mean(self, column: str, rolling_mean: pl.Series) -> pl.Series:
         """Subtract rolling mean from the column values."""
-        return (pl.col(column) - self.calculate_rolling_mean(column)).alias("y_subract_rolling_mean")
+        return (pl.col(column) - rolling_mean).alias("y_subract_rolling_mean")
 
-    def calculate_thresh_mult_by_std(self, column: str) -> pl.Series:
+    def calculate_thresh_mult_by_std(self, rolling_std: pl.Series) -> pl.Series:
         """Calculate threshold multiplied by the rolling standard deviation."""
-        return (self.calculate_rolling_std(column) * self.threshold).alias("thresh_mult_by_std")
+        return (rolling_std * self.threshold).alias("thresh_mult_by_std")
 
-    def calculate_anomaly(self, column: str) -> pl.Series:
+    def calculate_anomaly(self, column: str, rolling_mean: pl.Series, threshold_mult_by_std: pl.Series) -> pl.Series:
         """Detect anomalies based on the calculated threshold."""
-        return (abs(pl.col(column) - self.calculate_rolling_mean(column)) > self.calculate_thresh_mult_by_std(column)).alias("anomaly")
+        return (abs(pl.col(column) - rolling_mean) > threshold_mult_by_std).alias("anomaly")
 
-    def calculate_signal(self, column: str) -> pl.Series:
+    def calculate_signal(self, column: str, rolling_mean: pl.Series, threshold_mult_by_std: pl.Series) -> pl.Series:
         """Generate signals based on the detected anomalies."""
-        y_subtract_rolling_mean = self.calculate_y_subtract_rolling_mean(column)
-        anomaly_threshold = self.calculate_thresh_mult_by_std(column)
+        y_subtract_rolling_mean = self.calculate_y_subtract_rolling_mean(column, rolling_mean)
         
         return (
             pl
-            .when(y_subtract_rolling_mean > anomaly_threshold)
+            .when(y_subtract_rolling_mean > threshold_mult_by_std)
             .then(1)
-            .when(y_subtract_rolling_mean < -anomaly_threshold)
+            .when(y_subtract_rolling_mean < -threshold_mult_by_std)
             .then(-1)
             .otherwise(0)
             .alias("signal")
         )
     
-
-    def run(self, df: Union[pl.DataFrame, pl.LazyFrame], column: str, mode: str = 'optimized') -> Union[pl.DataFrame, pl.LazyFrame]:
+    def run(self, df: Union[pl.DataFrame, pl.LazyFrame], column: str, mode: str = 'optimize') -> Union[pl.DataFrame, pl.LazyFrame]:
         """
         Run the anomaly detection process on the input DataFrame.
-        
-        df: Union[pl.DataFrame, pl.LazyFrame]
-            The DataFrame for new columns to be added.
-        
-        column: str
-            The column in the provided DataFrame for anomaly detection to be applied
-        mode: str
-            Options are: 'lazy', 'no_change', 'optimize'
-            
-            'lazy': Ensures df is lazy. If it is not, makes it lazy. Returns LazyFrame.
-            'no_change': df type is unchaged. Returns original df type [LazyFrame | DataFrame].
-            'optimize': df type is forced to be Lazy for code plan, then collected on return. Returns DataFrame.
-        
         """
         if not isinstance(df, (pl.DataFrame, pl.LazyFrame)):
             raise ValueError("Input must be a Polars DataFrame or LazyFrame.")
@@ -101,18 +72,22 @@ class PolarsAnomalyDetector:
             raise ValueError("Mode must be one of 'lazy', 'no_change', 'optimize'.")
 
         if mode != 'no_change':
-            df = self.ensure_lazy_df(df)
+            df = df.lazy()
+
+        rolling_mean = self.calculate_rolling_mean(column)
+        rolling_std = self.calculate_rolling_std(column)
+        threshold_mult_by_std = self.calculate_thresh_mult_by_std(rolling_std)
 
         df = df.with_columns([
-            self.calculate_rolling_mean(column),
-            self.calculate_rolling_std(column),
-            self.calculate_y_subtract_rolling_mean(column),
-            self.calculate_thresh_mult_by_std(column),
-            self.calculate_anomaly(column),
-            self.calculate_signal(column)
+            rolling_mean,
+            rolling_std,
+            threshold_mult_by_std,
+            self.calculate_y_subtract_rolling_mean(column, rolling_mean),
+            self.calculate_anomaly(column, rolling_mean, threshold_mult_by_std),
+            self.calculate_signal(column, rolling_mean, threshold_mult_by_std)
         ])
 
-        return self.collect_lazy_df(df) if mode == "optimize" else df
+        return df.collect() if mode == "optimize" else df
 
     
     def plot(self, df: pl.DataFrame, column: str, xlabel: str = 'Time', ylabel: str = 'Value', figsize: Tuple[int, int] = (12, 8)) -> plt.figure:
